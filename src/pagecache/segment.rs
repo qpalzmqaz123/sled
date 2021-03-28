@@ -68,12 +68,17 @@ use crate::*;
 pub(crate) enum SegmentOp {
     Link {
         pid: PageId,
-        cache_info: CacheInfo,
+        log_offset: LogOffset,
+        size: SizeClass,
+        lsn: Lsn,
     },
     Replace {
         pid: PageId,
-        old_cache_infos: Vec<CacheInfo>,
-        new_cache_info: CacheInfo,
+        old_log_offsets: Vec<(SizeClass, LogOffset)>,
+        old_heap_items: Vec<HeapId>,
+        new_log_offset: LogOffset,
+        new_size: SizeClass,
+        lsn: Lsn,
     },
 }
 
@@ -375,8 +380,8 @@ impl Segment {
                 "insert_pid specified lsn {} for pid {} in segment {:?}",
                 lsn, pid, active
             );
-            active.pids.insert(pid);
             active.rss += size;
+            active.pids.insert(pid);
         } else {
             panic!("called insert_pid on {:?}", self);
         }
@@ -413,7 +418,7 @@ impl Segment {
                     pids.remove(&pid);
                     *replaced_pids += 1;
                 }
-                *rss = rss.checked_sub(sz).unwrap();
+                *rss = rss.saturating_sub(sz);
                 if replacement_lsn > *latest_replacement_lsn {
                     *latest_replacement_lsn = replacement_lsn;
                 }
@@ -763,10 +768,24 @@ impl SegmentAccountant {
     pub(super) fn apply_op(&mut self, op: &SegmentOp) -> Result<()> {
         use SegmentOp::*;
         match op {
-            Link { pid, cache_info } => self.mark_link(*pid, *cache_info),
-            Replace { pid, old_cache_infos, new_cache_info } => {
-                self.mark_replace(*pid, old_cache_infos, *new_cache_info)?
+            Link { pid, log_offset, size, lsn } => {
+                self.mark_link(*pid, *log_offset, size.size(), *lsn)
             }
+            Replace {
+                pid,
+                old_heap_items,
+                old_log_offsets,
+                new_log_offset,
+                new_size,
+                lsn,
+            } => self.mark_replace(
+                *pid,
+                old_log_offsets,
+                old_heap_items,
+                *new_log_offset,
+                new_size.size(),
+                *lsn,
+            )?,
         }
         Ok(())
     }
@@ -778,73 +797,43 @@ impl SegmentAccountant {
     pub(super) fn mark_replace(
         &mut self,
         pid: PageId,
-        old_cache_infos: &[CacheInfo],
-        new_cache_info: CacheInfo,
+        old_log_offsets: &[(SizeClass, LogOffset)],
+        old_heap_items: &[HeapId],
+        new_log_offset: LogOffset,
+        new_size: usize,
+        lsn: Lsn,
     ) -> Result<()> {
         #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.accountant_mark_replace);
 
-        if !new_cache_info.pointer.heap_pointer_merged_into_snapshot() {
-            self.mark_link(pid, new_cache_info);
-        }
-
-        let lsn = self.config.normalize(new_cache_info.lsn);
+        self.mark_link(pid, new_log_offset, new_size, lsn);
 
         trace!(
-            "mark_replace pid {} from cache infos {:?} to cache info {:?} with lsn {}",
+            "mark_replace pid {} from disk pointers {:?} to disk pointer {}",
             pid,
-            old_cache_infos,
-            new_cache_info,
-            lsn
+            old_log_offsets,
+            new_log_offset
         );
 
-        let new_idx =
-            new_cache_info.pointer.lid().map(|lid| self.segment_id(lid));
-
-        // Do we need to schedule any heap cleanups?
-        // Not if we just moved the pointer without changing
-        // the underlying heap, as is the case with a single heap
-        // item with nothing else.
-        let schedule_rm_heap_item = !(old_cache_infos.len() == 1
-            && old_cache_infos[0].pointer.is_heap_item()
-            && new_cache_info.pointer.is_heap_item()
-            && old_cache_infos[0].pointer.heap_id()
-                == new_cache_info.pointer.heap_id());
+        let new_idx = self.segment_id(new_log_offset);
 
         // we use this as a 0-allocation state machine to accumulate
         // how much data has been freed from each segment
         let mut cumulative_segment = None;
 
-        for old_cache_info in old_cache_infos {
-            let old_ptr = &old_cache_info.pointer;
-            let old_lid = if let Some(old_lid) = old_ptr.lid() {
-                old_lid
-            } else {
-                // the frag had been migrated to the heap store fully
-                continue;
-            };
+        for heap_id in old_heap_items {
+            trace!(
+                "queueing heap item removal for {:?} in our own segment",
+                heap_id,
+            );
+            self.segments[new_idx].remove_heap_item(*heap_id, &self.config);
+        }
 
-            if schedule_rm_heap_item && old_ptr.is_heap_item() {
-                trace!(
-                    "queueing heap item removal for {} in our own segment",
-                    old_ptr
-                );
-                if let Some(new_idx) = new_idx {
-                    self.segments[new_idx].remove_heap_item(
-                        old_ptr.heap_id().unwrap(),
-                        &self.config,
-                    );
-                } else {
-                    // this was migrated off-log and is present and stabilized
-                    // in the snapshot.
-                    self.config.heap.free(old_ptr.heap_id().unwrap());
-                }
-            }
-
-            let idx = self.segment_id(old_lid);
+        for (size_class, old_lid) in old_log_offsets {
+            let idx = self.segment_id(*old_lid);
             if let Some((old_idx, ref mut replaced_size)) = cumulative_segment {
                 if idx == old_idx {
-                    *replaced_size += old_cache_info.log_size;
+                    *replaced_size += size_class.size();
                 } else {
                     // apply the cumulative state and move to the next segment
                     self.segments[old_idx].remove_pid(
@@ -853,10 +842,10 @@ impl SegmentAccountant {
                         usize::try_from(*replaced_size).unwrap(),
                     );
                     self.possibly_clean_or_free_segment(old_idx, lsn)?;
-                    cumulative_segment = Some((idx, old_cache_info.log_size));
+                    cumulative_segment = Some((idx, size_class.size()));
                 }
             } else {
-                cumulative_segment = Some((idx, old_cache_info.log_size));
+                cumulative_segment = Some((idx, size_class.size()));
             }
         }
         if let Some((old_idx, replaced_size)) = cumulative_segment {
@@ -874,24 +863,22 @@ impl SegmentAccountant {
     /// Called from `PageCache` when some state has been added
     /// to a logical page at a particular offset. We ensure the
     /// page is present in the segment's page set.
-    pub(super) fn mark_link(&mut self, pid: PageId, cache_info: CacheInfo) {
+    pub(super) fn mark_link(
+        &mut self,
+        pid: PageId,
+        log_offset: LogOffset,
+        size: usize,
+        lsn: Lsn,
+    ) {
         #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.accountant_mark_link);
 
-        trace!("mark_link pid {} at cache info {:?}", pid, cache_info);
-        let lid = if let Some(lid) = cache_info.pointer.lid() {
-            lid
-        } else {
-            // item has been migrated off-log to the heap store
-            return;
-        };
-
-        let idx = self.segment_id(lid);
+        trace!("mark_link pid {} at cache info {:?}", pid, log_offset);
+        let idx = self.segment_id(log_offset);
 
         let segment = &mut self.segments[idx];
 
-        let segment_lsn = cache_info.lsn / self.config.segment_size as Lsn
-            * self.config.segment_size as Lsn;
+        let segment_lsn = self.config.normalize(lsn);
 
         // a race happened, and our Lsn does not apply anymore
         assert_eq!(
@@ -903,11 +890,7 @@ impl SegmentAccountant {
             segment.lsn()
         );
 
-        segment.insert_pid(
-            pid,
-            segment_lsn,
-            usize::try_from(cache_info.log_size).unwrap(),
-        );
+        segment.insert_pid(pid, segment_lsn, size);
     }
 
     fn possibly_clean_or_free_segment(

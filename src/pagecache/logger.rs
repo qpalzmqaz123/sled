@@ -419,6 +419,7 @@ impl Log {
                 item,
                 message_header,
                 destination,
+                reservation_lsn,
                 heap_reservation,
             )?;
 

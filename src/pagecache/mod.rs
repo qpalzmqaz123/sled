@@ -71,6 +71,35 @@ pub type Lsn = i64;
 /// A page identifier.
 pub type PageId = u64;
 
+/// A power of two size
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct SizeClass(u8);
+
+impl SizeClass {
+    pub const fn size(self) -> usize {
+        1 << self.0
+    }
+
+    pub fn from(item: usize) -> SizeClass {
+        SizeClass(
+            u8::try_from(item.next_power_of_two().trailing_zeros()).unwrap(),
+        )
+    }
+
+    pub fn from_u64(item: u64) -> SizeClass {
+        SizeClass(
+            u8::try_from(item.next_power_of_two().trailing_zeros()).unwrap(),
+        )
+    }
+
+    pub fn from_u32(item: u32) -> SizeClass {
+        SizeClass(
+            u8::try_from(item.next_power_of_two().trailing_zeros()).unwrap(),
+        )
+    }
+}
+
 /// Uses a non-varint `Lsn` to mark offsets.
 #[derive(Default, Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Debug)]
 #[repr(transparent)]
@@ -888,7 +917,13 @@ impl PageCache {
 
                     assert_ne!(old.last_lsn(), 0);
 
-                    self.log.iobufs.sa_mark_link(pid, cache_info, guard);
+                    self.log.iobufs.sa_mark_link(
+                        pid,
+                        log_reservation.pointer.lid().unwrap(),
+                        SizeClass::from(log_reservation.reservation_len()),
+                        lsn,
+                        guard,
+                    );
 
                     // NB complete must happen AFTER calls to SA, because
                     // when the iobuf's n_writers hits 0, we may transition
@@ -1405,19 +1440,21 @@ impl PageCacheInner {
                         guard.defer_destroy(page_view.read);
                     }
 
+                    let log_reservation = log_reservation.unwrap();
+
                     self.log.iobufs.sa_mark_replace(
                         pid,
-                        &page_view.cache_infos,
-                        cache_info,
+                        &page_view,
+                        log_reservation.pointer.lid().unwrap(),
+                        SizeClass::from(log_reservation.reservation_len()),
+                        log_reservation.lsn,
                         guard,
                     )?;
 
                     // NB complete must happen AFTER calls to SA, because
                     // when the iobuf's n_writers hits 0, we may transition
                     // the segment to inactive, resulting in a race otherwise.
-                    if let Some(log_reservation) = log_reservation {
-                        log_reservation.complete()?;
-                    }
+                    log_reservation.complete()?;
 
                     // only call accessed & page_out if called from
                     // something other than page_out itself
@@ -1651,8 +1688,10 @@ impl PageCacheInner {
                     trace!("cas_page succeeded on pid {}", pid);
                     self.log.iobufs.sa_mark_replace(
                         pid,
-                        &old.cache_infos,
-                        cache_info,
+                        &old,
+                        log_reservation.pointer.lid().unwrap(),
+                        SizeClass::from(log_reservation.reservation_len()),
+                        log_reservation.lsn,
                         guard,
                     )?;
 
@@ -1999,6 +2038,7 @@ impl PageCacheInner {
     fn page_out(&self, to_evict: Vec<PageId>, guard: &Guard) -> Result<()> {
         #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.page_out);
+
         for pid in to_evict {
             assert_ne!(pid, BATCH_MANIFEST_PID);
 
