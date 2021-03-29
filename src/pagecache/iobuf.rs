@@ -446,8 +446,24 @@ impl IoBufs {
         lsn: Lsn,
         guard: &Guard,
     ) -> Result<()> {
-        let old_log_offsets: &[(SizeClass, LogOffset)] = todo!();
-        let old_heap_items: &[HeapId] = todo!();
+        // TODO replace Page's vec of CacheInfo w/ array of this stuff
+        let old_log_offsets: &[(SizeClass, LogOffset)] = &old
+            .cache_infos
+            .iter()
+            .flat_map(|ci| {
+                ci.pointer
+                    .lid()
+                    .map(|lo| (SizeClass::from_u64(ci.log_size), lo))
+            })
+            .collect::<Vec<_>>();
+
+        // TODO replace Page's vec of CacheInfo w/ array of this stuff
+        let old_heap_items: &[HeapId] = &old
+            .cache_infos
+            .iter()
+            .flat_map(|ci| ci.pointer.heap_id())
+            .collect::<Vec<_>>();
+
         let worked: Option<Result<()>> = self.try_with_sa(|sa| {
             #[cfg(feature = "metrics")]
             let start = clock();
