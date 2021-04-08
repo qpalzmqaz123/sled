@@ -2736,3 +2736,33 @@ fn tree_bug_49() {
         0
     ))
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn tree_bug_50() {
+    // postmortem:
+    assert!(prop_tree_matches_btreemap(
+        vec![
+            Merge(Key(vec![10; 22]), 61),
+            Del(Key(vec![63; 31])),
+            Set(Key(vec![52; 19]), 245),
+            Del(Key(vec![])),
+            Merge(Key(vec![97; 22]), 72),
+            Del(Key(vec![])),
+            Set(Key(vec![57; 5]), 204),
+            Scan(Key(vec![48; 1]), 20),
+            Set(Key(vec![206; 9]), 198),
+            Merge(Key(vec![46; 1]), 38),
+            Restart,
+            Del(Key(vec![])),
+            Set(Key(vec![]), 199),
+            Merge(Key(vec![171; 1]), 102),
+            Merge(Key(vec![206; 9]), 27),
+            Restart,
+        ],
+        false,
+        false,
+        0,
+        0
+    ))
+}
