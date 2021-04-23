@@ -528,7 +528,7 @@ pub struct MessageHeader {
 }
 
 /// A number representing a segment number.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(transparent)]
 pub struct SegmentNumber(pub u64);
 
@@ -542,7 +542,7 @@ impl std::ops::Deref for SegmentNumber {
 
 /// A segment's header contains the new base LSN and a reference
 /// to the previous log segment.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone)]
 pub struct SegmentHeader {
     pub lsn: Lsn,
     pub max_stable_lsn: Lsn,
@@ -570,11 +570,8 @@ pub enum LogRead {
 
 impl LogRead {
     /// Return true if we read a successful Inline or Heap value.
-    pub fn is_successful(&self) -> bool {
-        match *self {
-            LogRead::Inline(..) | LogRead::Heap(..) => true,
-            _ => false,
-        }
+    pub const fn is_successful(&self) -> bool {
+        matches!(self, LogRead::Inline(..) | LogRead::Heap(..))
     }
 
     /// Return the underlying data read from a log read, if successful.
@@ -679,31 +676,23 @@ pub(crate) fn read_segment_header(
 }
 
 pub(crate) trait ReadAt {
-    fn pread_exact(&self, dst: &mut [u8], at: u64) -> std::io::Result<()>;
+    fn pread_exact(&self, dst: &mut [u8], at: u64) -> Result<()>;
 
-    fn pread_exact_or_eof(
-        &self,
-        dst: &mut [u8],
-        at: u64,
-    ) -> std::io::Result<usize>;
+    fn pread_exact_or_eof(&self, dst: &mut [u8], at: u64) -> Result<usize>;
 }
 
 impl ReadAt for File {
-    fn pread_exact(&self, dst: &mut [u8], at: u64) -> std::io::Result<()> {
+    fn pread_exact(&self, dst: &mut [u8], at: u64) -> Result<()> {
         pread_exact(self, dst, at)
     }
 
-    fn pread_exact_or_eof(
-        &self,
-        dst: &mut [u8],
-        at: u64,
-    ) -> std::io::Result<usize> {
+    fn pread_exact_or_eof(&self, dst: &mut [u8], at: u64) -> Result<usize> {
         pread_exact_or_eof(self, dst, at)
     }
 }
 
 impl ReadAt for BasedBuf {
-    fn pread_exact(&self, dst: &mut [u8], mut at: u64) -> std::io::Result<()> {
+    fn pread_exact(&self, dst: &mut [u8], mut at: u64) -> Result<()> {
         if at < self.offset
             || u64::try_from(dst.len()).unwrap() + at
                 > u64::try_from(self.buf.len()).unwrap() + self.offset
@@ -711,7 +700,8 @@ impl ReadAt for BasedBuf {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "failed to fill buffer",
-            ));
+            )
+            .into());
         }
         at -= self.offset;
         let at_usize = usize::try_from(at).unwrap();
@@ -720,18 +710,15 @@ impl ReadAt for BasedBuf {
         Ok(())
     }
 
-    fn pread_exact_or_eof(
-        &self,
-        dst: &mut [u8],
-        mut at: u64,
-    ) -> std::io::Result<usize> {
+    fn pread_exact_or_eof(&self, dst: &mut [u8], mut at: u64) -> Result<usize> {
         if at < self.offset
             || u64::try_from(self.buf.len()).unwrap() < at - self.offset
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "failed to fill buffer",
-            ));
+            )
+            .into());
         }
         at -= self.offset;
 
